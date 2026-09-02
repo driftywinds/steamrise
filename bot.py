@@ -1,5 +1,6 @@
 import os
 import json
+import sqlite3
 import asyncio
 import logging
 from datetime import datetime
@@ -28,6 +29,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '3600'))  # Default: 1 hour
 DATA_FILE = os.getenv('DATA_FILE', 'watched_games.json')
+HISTORY_FILE = os.getenv('HISTORY_FILE', 'price_history.db')
 
 # Supported currencies
 CURRENCIES = ['us', 'gb', 'eu', 'ru', 'br', 'au', 'jp', 'in', 'ca', 'cn']
@@ -38,6 +40,87 @@ class SteamPriceMonitor:
         self.session: Optional[aiohttp.ClientSession] = None
         self.watched_games: Dict = {}
         self.load_data()
+        self.init_history_db()
+
+    def init_history_db(self):
+        """Initialize the SQLite database for price-change history"""
+        try:
+            self.history_conn = sqlite3.connect(HISTORY_FILE)
+            self.history_conn.execute("PRAGMA journal_mode=WAL")
+            self.history_conn.execute("PRAGMA synchronous=NORMAL")
+            self.history_conn.execute("""
+                CREATE TABLE IF NOT EXISTS price_changes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    chat_id TEXT,
+                    app_id TEXT NOT NULL,
+                    game_name TEXT,
+                    currency TEXT,
+                    prev_price REAL,
+                    new_price REAL NOT NULL,
+                    prev_discount REAL,
+                    new_discount REAL NOT NULL,
+                    change_type TEXT NOT NULL
+                )
+            """)
+            self.history_conn.commit()
+            logger.info(f"Price history database initialized: {HISTORY_FILE}")
+        except Exception as e:
+            logger.error(f"Error initializing history database: {e}")
+            self.history_conn = None
+
+    def log_price_change(self, chat_id, app_id, game_name, currency,
+                         prev_price, new_price, prev_discount, new_discount,
+                         change_type):
+        """Record a single price-change event in the history database"""
+        if self.history_conn is None:
+            logger.warning("History DB unavailable; skipping price log")
+            return False
+        try:
+            self.history_conn.execute(
+                """INSERT INTO price_changes
+                   (timestamp, chat_id, app_id, game_name, currency,
+                    prev_price, new_price, prev_discount, new_discount, change_type)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    datetime.now().isoformat(),
+                    str(chat_id),
+                    str(app_id),
+                    game_name,
+                    str(currency),
+                    prev_price,
+                    new_price,
+                    prev_discount,
+                    new_discount,
+                    change_type,
+                )
+            )
+            self.history_conn.commit()
+            logger.info(f"Logged {change_type} for {game_name} (App {app_id})")
+            return True
+        except Exception as e:
+            logger.error(f"Error logging price change: {e}")
+            return False
+
+    def query_price_history(self, app_id, currency=None, limit=50):
+        """Query logged price changes for a game, newest first"""
+        if self.history_conn is None:
+            return []
+        try:
+            query = "SELECT * FROM price_changes WHERE app_id = ?"
+            params = [str(app_id)]
+            if currency:
+                query += " AND currency = ?"
+                params.append(str(currency).lower())
+            query += " ORDER BY timestamp DESC LIMIT ?"
+            params.append(limit)
+            cursor = self.history_conn.execute(query, params)
+            rows = cursor.fetchall()
+            cols = [d[0] for d in cursor.description]
+            return [dict(zip(cols, row)) for row in rows]
+        except Exception as e:
+            logger.error(f"Error querying history: {e}")
+            return []
 
     def load_data(self):
         """Load watched games from file"""
@@ -255,6 +338,36 @@ class SteamPriceMonitor:
                             message
                         )
                     
+                    # Determine change type and log to history database
+                    prev_price = watch_data['last_price']
+                    prev_discount = watch_data['last_discount']
+                    if prev_price is None and prev_discount is None:
+                        change_type = 'initial'
+                    elif current_price != (prev_price or 0) and current_discount != (prev_discount or 0):
+                        change_type = 'price_and_discount_change'
+                    elif current_price != (prev_price or 0):
+                        change_type = 'price_change'
+                    elif (prev_discount or 0) == 0 and current_discount > 0:
+                        change_type = 'discount_start'
+                    elif current_discount == 0 and (prev_discount or 0) > 0:
+                        change_type = 'discount_end'
+                    elif current_discount != (prev_discount or 0):
+                        change_type = 'discount_change'
+                    else:
+                        change_type = 'change'
+                    
+                    self.log_price_change(
+                        watch_data['chat_id'],
+                        watch_data['app_id'],
+                        watch_data['game_name'],
+                        watch_data['currency'],
+                        prev_price,
+                        current_price,
+                        prev_discount,
+                        current_discount,
+                        change_type
+                    )
+                    
                     # Update stored values
                     watch_data['last_price'] = current_price
                     watch_data['last_discount'] = current_discount
@@ -347,6 +460,7 @@ I'll help you track Steam game prices and notify you when they change!
 /watch - Add a game to watch
 /list - Show your watched games
 /remove - Remove a game from watch list
+/history - View logged price-change history
 /apprise - Manage notification endpoints
 /help - Show this help message
 
@@ -463,6 +577,91 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         message += "\n"
     
+    await update.message.reply_text(message, parse_mode='HTML')
+
+
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /history command to view logged price changes"""
+    if len(context.args) < 1:
+        await update.message.reply_text(
+            "❌ Usage: /history <app_id> [currency]\n"
+            "Example: /history 570 us\n\n"
+            "Shows the logged price-change history for a game."
+        )
+        return
+
+    app_id = context.args[0]
+    currency = context.args[1].lower() if len(context.args) > 1 else None
+
+    records = monitor.query_price_history(app_id, currency=currency)
+
+    if not records:
+        await update.message.reply_text(
+            f"📭 No price history found for App ID {app_id}"
+            f"{' (' + currency.upper() + ')' if currency else ''}."
+        )
+        return
+
+    game_name = records[0].get('game_name', 'Unknown Game')
+    currency_label = (records[0].get('currency') or 'us').upper()
+
+    message = f"📊 <b>{game_name}</b> — Price History\n"
+    message += f"App ID: {app_id}"
+    if currency:
+        message += f" | Currency: {currency_label}"
+    message += f"\n({len(records)} change(s))\n\n"
+
+    for rec in records:
+        timestamp = rec['timestamp']
+        change_type = rec.get('change_type', 'change')
+        prev_price = rec.get('prev_price')
+        new_price = rec.get('new_price')
+        prev_discount = rec.get('prev_discount')
+        new_discount = rec.get('new_discount')
+
+        date_part = timestamp[:16].replace('T', ' ')  # YYYY-MM-DD HH:MM
+
+        if change_type == 'price_change':
+            icon = "📉" if new_price < prev_price else "📈"
+            title = "Price change"
+        elif change_type == 'price_and_discount_change':
+            icon = "🔄"
+            title = "Price + discount change"
+        elif change_type == 'discount_start':
+            icon = "🔥"
+            title = "Discount started"
+        elif change_type == 'discount_end':
+            icon = "⚠️"
+            title = "Discount ended"
+        elif change_type == 'discount_change':
+            icon = "📊"
+            title = "Discount changed"
+        else:
+            icon = "✅"
+            title = "Now monitoring"
+
+        message += f"{icon} <b>{title}</b> — {date_part}\n"
+        if change_type == 'initial':
+            message += f"   Price: {currency_label} {new_price:.2f}"
+            if new_discount > 0:
+                message += f" ({new_discount}% OFF)"
+            message += "\n"
+        else:
+            if prev_price is not None and new_price != prev_price:
+                message += f"   Price: {currency_label} {prev_price:.2f} → {currency_label} {new_price:.2f}\n"
+            if new_discount != (prev_discount or 0):
+                if new_discount > (prev_discount or 0):
+                    message += f"   Discount: {prev_discount}% → {new_discount}% OFF\n"
+                else:
+                    message += f"   Discount: {prev_discount}% → {new_discount}% OFF\n"
+            elif new_discount > 0:
+                message += f"   Discount: {new_discount}% OFF\n"
+        message += "\n"
+
+    # Trim if too long for one message
+    if len(message) > 4000:
+        message = message[:3900] + "\n… (truncated)"
+
     await update.message.reply_text(message, parse_mode='HTML')
 
 
@@ -716,6 +915,7 @@ def main():
         application.add_handler(CommandHandler("watch", watch_command))
         application.add_handler(CommandHandler("list", list_command))
         application.add_handler(CommandHandler("remove", remove_command))
+        application.add_handler(CommandHandler("history", history_command))
         application.add_handler(CommandHandler("apprise", apprise_command))
         
         # Start bot
