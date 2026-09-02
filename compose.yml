@@ -4,7 +4,7 @@ services:
   steam-price-bot:
 #    build: .
     image: ghcr.io/driftywinds/steamrise
-    container_name: steam-price-bot
+    container_name: steamrise
     restart: unless-stopped
     env_file:
       - .env

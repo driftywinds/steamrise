@@ -3,3 +3,5 @@ requests
 python-dotenv
 apprise
 colorama
+aiohttp
+python-telegram-bot[job-queue]
